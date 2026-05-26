@@ -35,6 +35,7 @@ docker exec -it znc bash
 apk add znc-dev build-base
 
 # Build the module
+# Note: znc-buildmod writes the .so to the current directory (/ by default)
 znc-buildmod /config/modules/crypt2.cpp
 
 # Copy the compiled .so to the modules directory
