@@ -1,6 +1,6 @@
 # znc-crypt2
 
-A drop-in replacement for ZNC's built-in `crypt` module, upgraded from Blowfish-CBC to **AES-256-GCM**.
+A drop-in replacement for ZNC's built-in `crypt` module, upgraded from Blowfish-CBC to **AES-256-GCM** with HKDF key derivation and AAD target binding.
 
 Same wire format, same commands, same setup. Just better encryption.
 
@@ -11,6 +11,8 @@ Same wire format, same commands, same setup. Just better encryption.
 | Cipher | Blowfish-CBC | AES-256-GCM |
 | IV/Nonce | `time + rand()` (weak) | `RAND_bytes()` (cryptographically random) |
 | Authentication | None (malleable) | GCM auth tag (tamper detection) |
+| Key derivation | Raw key bytes | HKDF-SHA256 |
+| Target binding | None | AAD prevents message transplantation across targets |
 | Wire format | `+OK *<base64>` | `+OK *<base64>` (identical) |
 | Commands | unchanged | unchanged |
 
@@ -29,7 +31,7 @@ Same wire format, same commands, same setup. Just better encryption.
 sudo cp crypt2.cpp /srv/znc/data/modules/
 
 # Shell into the container
-docker exec -it znc bash
+docker exec -it znc sh
 
 # Inside the container — install build tools (Alpine-based image)
 apk add znc-dev build-base
@@ -59,9 +61,15 @@ From your IRC client:
 /msg *status LoadModule crypt2
 ```
 
+If you're replacing a previous version of crypt2, unload it first:
+```
+/msg *status UnloadModule crypt2
+/msg *status LoadModule crypt2
+```
+
 ## Usage
 
-All commands are identical to the original crypt module, sent to `*crypt2`.
+All commands are sent to `*crypt2`.
 
 ### Key exchange (automatic, recommended)
 
@@ -82,7 +90,7 @@ Set it on both sides:
 /msg *crypt2 SetKey <nick|#channel> <key>
 ```
 
-Both sides must use the **same key**.
+Both sides must use the **same key**. If you previously had crypt2 loaded with an older key, you must set a new key — HKDF derives differently from the same input compared to the old version.
 
 ### Other commands
 
@@ -97,6 +105,14 @@ Both sides must use the **same key**.
 
 Prefix your message with ` `` ` (two backticks) to send plaintext even with a key set.
 
+## Security notes
+
+- **AAD (Associated Authenticated Data):** ciphertext is cryptographically bound to the target nick or channel. A message encrypted for `#channel` cannot be successfully decrypted as a private message or replayed to a different channel, even with the same key.
+- **HKDF:** the same raw key produces a different derived key per target, providing additional key separation beyond AAD.
+- **Tamper detection:** any modification to the ciphertext, nonce, or GCM tag causes decryption to fail with `(decryption failed - wrong key or tampered message)`.
+- **Keys are stored in plaintext on disk**, same as the original crypt module. Use SSL between ZNC and your IRC client.
+- DH1080 key exchange is supported but is unauthenticated (no MITM protection). For higher security, use manual `SetKey` with an out-of-band key exchange.
+
 ## Verifying encryption
 
 The ciphertext byte length should always equal `12 (nonce) + len(plaintext) + 16 (tag)`:
@@ -104,9 +120,3 @@ The ciphertext byte length should always equal `12 (nonce) + len(plaintext) + 16
 ```bash
 echo "<base64 blob>" | base64 -d | wc -c
 ```
-
-## Notes
-
-- Keys are stored in plaintext on disk, same as the original crypt module
-- Use SSL between ZNC and your IRC client
-- Coexists with the original crypt module — both can be loaded simultaneously
