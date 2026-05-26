@@ -23,7 +23,13 @@
 // Keys can be set manually with SetKey or exchanged via KeyX (DH1080).
 // For manual keys, generate 32 random bytes and base64-encode them:
 //   openssl rand -base64 32
-// Then: /msg *crypt SetKey <nick/#chan> <that string>
+// Then: /msg *crypt2 SetKey <nick/#chan> <that string>
+//
+// Security improvements over original crypt module:
+//   - AES-256-GCM replaces Blowfish-CBC
+//   - HKDF (RFC 5869) replaces raw SHA256 for key derivation
+//   - AAD (Associated Authenticated Data) binds ciphertext to target
+//     nick/channel, preventing message transplantation across targets
 //
 // NOTE: Keys are stored in plaintext on disk (same as original).
 //       Use SSL between ZNC and your client.
@@ -31,6 +37,7 @@
 #include <openssl/bn.h>
 #include <openssl/dh.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/rand.h>
 #include <znc/Chan.h>
 #include <znc/IRCNetwork.h>
@@ -47,25 +54,57 @@
 #define AES_TAG_LEN   16
 #define AES_KEY_LEN   32
 
-// Derive a 32-byte AES key from whatever string the user set.
-// If it's already 32+ raw bytes after base64 decoding, use those.
-// Otherwise SHA256 the raw string to get 32 bytes.
-static bool DeriveKey(const CString& sKey, unsigned char out[AES_KEY_LEN]) {
-    // Try base64 decode first
+// HKDF info string — identifies this module/version
+static const char* HKDF_INFO = "znc-crypt2-v1";
+
+// Derive a 32-byte AES key from the user-supplied key string using HKDF-SHA256.
+// sTarget (nick or #channel, lowercased) is used as the HKDF salt so that
+// the same raw key produces a different derived key per target — this is a
+// secondary layer on top of AAD, ensuring key separation at derivation time.
+static bool DeriveKey(const CString& sKey, const CString& sTarget,
+                      unsigned char out[AES_KEY_LEN]) {
+    // Decode base64 if possible, otherwise use raw bytes
     CString sDecoded = sKey;
-    size_t len = sDecoded.Base64Decode();
-    if (len >= AES_KEY_LEN) {
-        memcpy(out, sDecoded.data(), AES_KEY_LEN);
-        return true;
+    size_t decoded_len = sDecoded.Base64Decode();
+    const unsigned char* ikm;
+    size_t ikm_len;
+    if (decoded_len >= 16) {
+        ikm     = (const unsigned char*)sDecoded.data();
+        ikm_len = decoded_len;
+    } else {
+        ikm     = (const unsigned char*)sKey.data();
+        ikm_len = sKey.size();
     }
-    // Fall back: SHA256 the key string
-    sha256((const unsigned char*)sKey.data(), sKey.size(), out);
-    return true;
+
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr);
+    if (!ctx) return false;
+
+    bool ok =
+        EVP_PKEY_derive_init(ctx) > 0 &&
+        EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) > 0 &&
+        EVP_PKEY_CTX_set1_hkdf_salt(ctx,
+            (const unsigned char*)sTarget.data(), sTarget.size()) > 0 &&
+        EVP_PKEY_CTX_set1_hkdf_key(ctx, ikm, ikm_len) > 0 &&
+        EVP_PKEY_CTX_add1_hkdf_info(ctx,
+            (const unsigned char*)HKDF_INFO, strlen(HKDF_INFO)) > 0;
+
+    if (ok) {
+        size_t outlen = AES_KEY_LEN;
+        ok = EVP_PKEY_derive(ctx, out, &outlen) > 0 && outlen == AES_KEY_LEN;
+    }
+
+    EVP_PKEY_CTX_free(ctx);
+    return ok;
 }
 
-static CString AESEncrypt(const CString& sKey, const CString& sPlaintext) {
+// sTarget is the lowercased nick or channel name, used as AAD.
+// This binds the ciphertext to the target — a message encrypted for
+// #channel cannot be successfully decrypted as a private message or
+// for a different channel, even with the same key.
+static CString AESEncrypt(const CString& sKey, const CString& sTarget,
+                           const CString& sPlaintext) {
     unsigned char key[AES_KEY_LEN];
-    if (!DeriveKey(sKey, key)) return "";
+    if (!DeriveKey(sKey, sTarget, key)) return "";
 
     unsigned char nonce[AES_NONCE_LEN];
     if (RAND_bytes(nonce, AES_NONCE_LEN) != 1) return "";
@@ -73,17 +112,19 @@ static CString AESEncrypt(const CString& sKey, const CString& sPlaintext) {
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) return "";
 
-    int len = 0;
-    int ciphertext_len = 0;
+    int len = 0, ciphertext_len = 0;
     std::vector<unsigned char> ciphertext(sPlaintext.size() + AES_TAG_LEN);
 
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, nonce) != 1 ||
+    bool ok =
+        EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_EncryptInit_ex(ctx, nullptr, nullptr, key, nonce) == 1 &&
+        // Feed target as AAD — authenticated but not encrypted
+        EVP_EncryptUpdate(ctx, nullptr, &len,
+            (const unsigned char*)sTarget.data(), sTarget.size()) == 1 &&
         EVP_EncryptUpdate(ctx, ciphertext.data(), &len,
-                          (const unsigned char*)sPlaintext.data(), sPlaintext.size()) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
+            (const unsigned char*)sPlaintext.data(), sPlaintext.size()) == 1;
+
+    if (!ok) { EVP_CIPHER_CTX_free(ctx); return ""; }
     ciphertext_len = len;
 
     if (EVP_EncryptFinal_ex(ctx, ciphertext.data() + len, &len) != 1) {
@@ -96,7 +137,6 @@ static CString AESEncrypt(const CString& sKey, const CString& sPlaintext) {
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, AES_TAG_LEN, tag);
     EVP_CIPHER_CTX_free(ctx);
 
-    // Output: nonce + ciphertext + tag
     CString sResult;
     sResult.append((char*)nonce, AES_NONCE_LEN);
     sResult.append((char*)ciphertext.data(), ciphertext_len);
@@ -104,12 +144,12 @@ static CString AESEncrypt(const CString& sKey, const CString& sPlaintext) {
     return sResult;
 }
 
-static CString AESDecrypt(const CString& sKey, const CString& sData) {
-    // Minimum: nonce + tag (no empty plaintext check needed, 0-byte messages are valid)
+static CString AESDecrypt(const CString& sKey, const CString& sTarget,
+                           const CString& sData) {
     if (sData.size() < AES_NONCE_LEN + AES_TAG_LEN) return "";
 
     unsigned char key[AES_KEY_LEN];
-    if (!DeriveKey(sKey, key)) return "";
+    if (!DeriveKey(sKey, sTarget, key)) return "";
 
     const unsigned char* nonce      = (const unsigned char*)sData.data();
     const unsigned char* ciphertext = nonce + AES_NONCE_LEN;
@@ -122,17 +162,19 @@ static CString AESDecrypt(const CString& sKey, const CString& sData) {
     std::vector<unsigned char> plaintext(ciphertext_len);
     int len = 0;
 
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1 ||
-        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, nonce) != 1 ||
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_TAG_LEN, (void*)tag) != 1 ||
-        EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
-        return "";
-    }
+    bool ok =
+        EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) == 1 &&
+        EVP_DecryptInit_ex(ctx, nullptr, nullptr, key, nonce) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_TAG_LEN, (void*)tag) == 1 &&
+        // Feed same AAD for verification
+        EVP_DecryptUpdate(ctx, nullptr, &len,
+            (const unsigned char*)sTarget.data(), sTarget.size()) == 1 &&
+        EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext, ciphertext_len) == 1;
 
-    // Final check - this is where GCM authentication happens
+    if (!ok) { EVP_CIPHER_CTX_free(ctx); return ""; }
+
+    // Final — GCM authentication happens here, fails if AAD or tag mismatch
     if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1) {
-        // Authentication failed - message tampered or wrong key
         EVP_CIPHER_CTX_free(ctx);
         return "";
     }
@@ -244,17 +286,17 @@ class CCryptMod : public CModule {
   public:
     MODCONSTRUCTOR(CCryptMod), m_pDH(DH_new(), DH_free) {
         AddHelpCommand();
-        AddCommand("DelKey",  t_d("<#chan|Nick>"),         t_d("Remove a key for nick or channel"),
+        AddCommand("DelKey",       t_d("<#chan|Nick>"),       t_d("Remove a key for nick or channel"),
                    [=](const CString& sLine) { OnDelKeyCommand(sLine); });
-        AddCommand("SetKey",  t_d("<#chan|Nick> <Key>"),   t_d("Set a key for nick or channel"),
+        AddCommand("SetKey",       t_d("<#chan|Nick> <Key>"), t_d("Set a key for nick or channel"),
                    [=](const CString& sLine) { OnSetKeyCommand(sLine); });
-        AddCommand("ListKeys", "",                          t_d("List all keys"),
+        AddCommand("ListKeys",     "",                        t_d("List all keys"),
                    [=](const CString& sLine) { OnListKeysCommand(sLine); });
-        AddCommand("KeyX",    t_d("<Nick>"),               t_d("Start a DH1080 key exchange with nick"),
+        AddCommand("KeyX",         t_d("<Nick>"),             t_d("Start a DH1080 key exchange with nick"),
                    [=](const CString& sLine) { OnKeyXCommand(sLine); });
-        AddCommand("GetNickPrefix", "",                    t_d("Get the nick prefix"),
+        AddCommand("GetNickPrefix","",                        t_d("Get the nick prefix"),
                    [=](const CString& sLine) { OnGetNickPrefixCommand(sLine); });
-        AddCommand("SetNickPrefix", t_d("[Prefix]"),       t_d("Set the nick prefix"),
+        AddCommand("SetNickPrefix", t_d("[Prefix]"),          t_d("Set the nick prefix"),
                    [=](const CString& sLine) { OnSetNickPrefixCommand(sLine); });
     }
 
@@ -281,7 +323,7 @@ class CCryptMod : public CModule {
     }
 
     EModRet OnPrivNotice(CNick& Nick, CString& sMessage) override {
-        CString sCommand    = sMessage.Token(0);
+        CString sCommand     = sMessage.Token(0);
         CString sOtherPubKey = sMessage.Token(1);
 
         if ((sCommand.Equals("DH1080_INIT") || sCommand.Equals("DH1080_INIT_CBC")) &&
@@ -317,11 +359,11 @@ class CCryptMod : public CModule {
         return CONTINUE;
     }
 
-    EModRet OnPrivAction(CNick& Nick, CString& sMessage)                  override { FilterIncoming(Nick.GetNick(),      Nick, sMessage); return CONTINUE; }
-    EModRet OnChanMsg(CNick& Nick, CChan& Channel, CString& sMessage)     override { FilterIncoming(Channel.GetName(),   Nick, sMessage); return CONTINUE; }
-    EModRet OnChanNotice(CNick& Nick, CChan& Channel, CString& sMessage)  override { FilterIncoming(Channel.GetName(),   Nick, sMessage); return CONTINUE; }
-    EModRet OnChanAction(CNick& Nick, CChan& Channel, CString& sMessage)  override { FilterIncoming(Channel.GetName(),   Nick, sMessage); return CONTINUE; }
-    EModRet OnTopic(CNick& Nick, CChan& Channel, CString& sMessage)       override { FilterIncoming(Channel.GetName(),   Nick, sMessage); return CONTINUE; }
+    EModRet OnPrivAction(CNick& Nick, CString& sMessage)                 override { FilterIncoming(Nick.GetNick(),    Nick, sMessage); return CONTINUE; }
+    EModRet OnChanMsg(CNick& Nick, CChan& Channel, CString& sMessage)    override { FilterIncoming(Channel.GetName(), Nick, sMessage); return CONTINUE; }
+    EModRet OnChanNotice(CNick& Nick, CChan& Channel, CString& sMessage) override { FilterIncoming(Channel.GetName(), Nick, sMessage); return CONTINUE; }
+    EModRet OnChanAction(CNick& Nick, CChan& Channel, CString& sMessage) override { FilterIncoming(Channel.GetName(), Nick, sMessage); return CONTINUE; }
+    EModRet OnTopic(CNick& Nick, CChan& Channel, CString& sMessage)      override { FilterIncoming(Channel.GetName(), Nick, sMessage); return CONTINUE; }
 
     EModRet OnNumericMessage(CNumericMessage& Message) override {
         if (Message.GetCode() != 332) return CONTINUE;
@@ -346,7 +388,7 @@ class CCryptMod : public CModule {
 
         MCString::iterator it = FindNV(sTarget.AsLower());
         if (it != EndNV()) {
-            CString sEncrypted = AESEncrypt(it->second, sMessage);
+            CString sEncrypted = AESEncrypt(it->second, sTarget.AsLower(), sMessage);
             if (sEncrypted.empty()) return;
             sEncrypted.Base64Encode();
             Msg.SetText("+OK *" + sEncrypted);
@@ -358,7 +400,7 @@ class CCryptMod : public CModule {
             MCString::iterator it = FindNV(sTarget.AsLower());
             if (it != EndNV()) {
                 sMessage.Base64Decode();
-                CString sDecrypted = AESDecrypt(it->second, sMessage);
+                CString sDecrypted = AESDecrypt(it->second, sTarget.AsLower(), sMessage);
                 if (sDecrypted.empty()) {
                     sMessage = "(decryption failed - wrong key or tampered message)";
                     return;
